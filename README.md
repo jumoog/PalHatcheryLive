@@ -58,7 +58,7 @@ the transition only.
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Copies `Mods/PalHatcheryLive` to
+Copies `PalHatcheryLive` to
 `<Palworld>\Pal\Binaries\Win64\ue4ss\Mods\PalHatcheryLive`. The `enabled.txt` in
 the mod folder is enough for UE4SS 3.0.1 — no entry in `mods.json` / `mods.txt`
 required. Hot reload is usually off (`EnableHotReloadSystem = 0`), so restart

@@ -11,7 +11,7 @@ if (-not (Test-Path $modsDir)) {
     throw "UE4SS-Mods-Ordner nicht gefunden: $modsDir"
 }
 
-$src = Join-Path $PSScriptRoot "Mods\PalHatcheryLive"
+$src = Join-Path $PSScriptRoot "PalHatcheryLive"
 $dst = Join-Path $modsDir "PalHatcheryLive"
 
 New-Item -ItemType Directory -Force -Path (Join-Path $dst "Scripts") | Out-Null

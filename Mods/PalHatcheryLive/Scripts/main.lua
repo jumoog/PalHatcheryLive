@@ -10,10 +10,14 @@
 --
 --   For every incubator panel that is currently on screen (the world HUD over
 --   the machine as well as the big interaction panel), this mod:
---     1. re-runs the panel's OWN display-update functions on an interval,
---     2. fires that update immediately when the game tells the client that a
---        hatch completed (server -> client notify / OnRep hooks),
---     3. un-greys the collect button once the model reports hatched pals.
+--     1. re-runs the panel's OWN display-update functions when something
+--        actually changes — panel opened, hatch notify hook fired, or the
+--        model's hatched-slot count moved,
+--     2. never on a fixed interval: re-poking a panel whose state has not
+--        changed re-applies its "complete" presentation and makes the collect
+--        button flicker,
+--     3. un-greys the collect button on such a transition, and only if the
+--        button really is disabled.
 --
 --   Collecting stays vanilla — you click the button. AUTO_COLLECT = true makes
 --   the mod send RequestObtainAllHatchedCharacter itself.
@@ -49,17 +53,28 @@
 --   panel currently on screen.
 -- ============================================================================
 
-local VERSION = "1.2.2"
+local VERSION = "1.5.1"
 
 local CONFIG = {
-    -- Tick cadence (ms). While no panel is open only every Nth tick scans.
+    -- Tick cadence (ms). Scanning for panels is the expensive part (one full
+    -- UObject-array sweep per class), so it happens on a slow multiple of the
+    -- tick: every 8 ticks (~4s) while nothing is open, every 12 (~6s) to notice
+    -- a second panel opening on top of one already being serviced.
     POLL_MS = 500,
-    IDLE_EVERY_NTH_TICK = 4,
-    -- Re-scan for newly opened panels every Nth tick while one is already open.
-    RESCAN_EVERY_NTH_TICK = 4,
+    IDLE_EVERY_NTH_TICK = 8,
+    RESCAN_EVERY_NTH_TICK = 12,
 
-    -- Re-run each open panel's own update functions this often.
-    REFRESH_INTERVAL_MS = 2000,
+    -- Refreshes are CHANGE-DRIVEN, not periodic: on panel open, on a hatch
+    -- notify hook, and when the model's hatched-slot count changes (polled with
+    -- a cheap native getter every tick — that costs nothing and never touches
+    -- the UI). Re-poking the panel on a fixed interval made the finished-state
+    -- button flicker, because re-running the panel's update re-applies its
+    -- "complete" presentation (these widgets carry Anm_* animations).
+    --
+    -- Heartbeat fallback, used ONLY for panels whose model exposes no
+    -- hatched-state readout (the single-egg incubator has no
+    -- GetHatchedStateArray), i.e. where there is no change detector. 0 = off.
+    HEARTBEAT_MS = 15000,
 
     -- Which reflected functions count as "redraw the display". Allow-list by
     -- name shape, then a hard deny-list of anything that could act rather than
@@ -75,11 +90,16 @@ local CONFIG = {
     },
 
     -- Un-grey the collect button when the model reports hatched pals.
-    -- NOTE: measured on this build, WBP_CommonButton_OpenAll already reports
-    -- enabled=true with an empty hatchery, so this is a belt-and-braces path
-    -- for the case where the panel really does gate the button — the actual fix
-    -- is the OnEggArrayUpdated() refresh above.
-    ENABLE_BUTTONS = true,
+    --
+    -- OFF by default, because on this build there is nothing to un-grey: the
+    -- dump of WBP_CommonButton_C shows it derives straight from UserWidget, not
+    -- from CommonButtonBase — it has no enabled/disabled state at all
+    -- (GetIsInteractionEnabled does not even exist on it, GetIsEnabled is
+    -- always true). Its look is driven by animations (Anm_DefaultToRed,
+    -- AnmEvent_Red/Normal/Focus), which is also why re-poking the panel while
+    -- the state sat still replayed that animation and looked like flicker.
+    -- Kept for other builds/locales where a panel really does gate its button.
+    ENABLE_BUTTONS = false,
     -- Preferred path: the panel names its buttons as reflected properties.
     -- Verified on WBP_IngameMenu_Incubator_Multiple_C: WBP_CommonButton_OpenAll
     -- ("collect all", bound to ..._OpenAll_..._OnClicked) next to
@@ -89,7 +109,7 @@ local CONFIG = {
     -- Fallback when no named property matches: scan for a disabled button whose
     -- label matches one of these (lower-case Lua patterns). Every disabled
     -- button's label is logged once, so a missing language can be added here.
-    COLLECT_LABELS = { "collect", "einsammeln", "abholen", "erhalten", "受け取" },
+    COLLECT_LABELS = { "collect", "einsammeln", "abholen", "erhalten" },
 
     -- Widget subtrees never worth walking: the incubator panel embeds the whole
     -- player inventory, which is hundreds of nodes of unrelated item slots.
@@ -282,17 +302,23 @@ end
 
 -- Every visible incubator panel right now. Several instances of a class can
 -- coexist (a stale hidden one next to the live one), so visibility is required.
-local function findMenus()
+--
+-- Each FindAllOf sweeps the whole UObject array, so this is the single most
+-- expensive thing the mod does: classes we already service are skipped, and the
+-- caller keeps the scan rate low.
+local function findMenus(skipClasses)
     local out = {}
     for _, cls in ipairs(MENU_CLASSES) do
-        local found = nil
-        pcall(function() found = FindAllOf(cls) end)
-        if found then
-            for _, w in ipairs(found) do
-                if alive(w) then
-                    local fn = fullNameOf(w)
-                    if fn and not fn:find("Default__", 1, true) and isShowing(w) then
-                        out[#out + 1] = { widget = w, class = cls, id = fn }
+        if not (skipClasses and skipClasses[cls]) then
+            local found = nil
+            pcall(function() found = FindAllOf(cls) end)
+            if found then
+                for _, w in ipairs(found) do
+                    if alive(w) then
+                        local fn = fullNameOf(w)
+                        if fn and not fn:find("Default__", 1, true) and isShowing(w) then
+                            out[#out + 1] = { widget = w, class = cls, id = fn }
+                        end
                     end
                 end
             end
@@ -368,8 +394,27 @@ local function callNoArg(obj, cn, fname)
     return true
 end
 
+-- The incubator's own sub-widgets, collected ONCE per panel open.
+--
+-- This used to be a full widget-tree walk on every refresh — hundreds of
+-- reflection calls (GetClass/GetFName/ToString per node) every interval, on the
+-- game thread. That is what made the game hitch once per interval. The tree of
+-- an open panel does not change identity, so it is walked once and cached; a
+-- dead entry invalidates the cache and triggers a single re-walk.
+local function resolveSubWidgets(menu)
+    local out = {}
+    walkWidgets(menu, function(w)
+        local cn = classNameOf(w)
+        if cn and cn:find("_C$") and cn:find("Incubator") then
+            out[#out + 1] = { widget = w, class = cn }
+        end
+    end)
+    return out
+end
+
 -- Re-run one panel's own display update (the panel itself plus its slot rows).
-local function refreshPanel(menu)
+local function refreshPanel(st)
+    local menu = st.widget
     local ran = 0
 
     local mcn = classNameOf(menu)
@@ -379,16 +424,16 @@ local function refreshPanel(menu)
         end
     end
 
-    -- Sub-widgets, restricted to the incubator's own classes: a wider net also
-    -- caught the embedded inventory's slot widgets, which have nothing to do
-    -- with hatching and cost a call every interval.
-    walkWidgets(menu, function(w)
-        local cn = classNameOf(w)
-        if not cn or not cn:find("_C$") or not cn:find("Incubator") then return end
-        for _, fname in ipairs(refreshNamesFor(w)) do
-            if callNoArg(w, cn, fname) then ran = ran + 1 end
+    if st.subWidgets == nil then st.subWidgets = resolveSubWidgets(menu) end
+    for _, sub in ipairs(st.subWidgets) do
+        if not alive(sub.widget) then
+            st.subWidgets = nil -- stale tree: re-walk once, next interval
+            break
         end
-    end)
+        for _, fname in ipairs(refreshNamesFor(sub.widget)) do
+            if callNoArg(sub.widget, sub.class, fname) then ran = ran + 1 end
+        end
+    end
 
     if ran == 0 then
         logOnce("norefresh:" .. tostring(mcn),
@@ -430,7 +475,28 @@ local function looksLikeModel(o)
     return cn ~= nil and cn:find("HatchingEggModel") ~= nil
 end
 
+-- Which property of a panel class holds its model. The panel INSTANCE is
+-- recreated on every open (its full name changes, so an instance cache misses),
+-- but the property name is a property of the class and never changes:
+-- learn it once, then resolving a model is a single read instead of a widget
+-- walk plus a full ObjectProperty enumeration.
+--   WBP_IngameMenu_Incubator_Multiple_C -> "Hatching Egg Model"
+--   WBP_Ingame_Incubator_Multiple_C     -> "Model"
+--   WBP_Ingame_Incubator_C              -> "Model"
+local modelPropByClass = {}
+
 local function resolveModel(menu)
+    local mcn = classNameOf(menu)
+
+    local known = mcn and modelPropByClass[mcn]
+    if known then
+        local val = nil
+        pcall(function() val = menu[known] end)
+        if looksLikeModel(val) then return val end
+        -- Class changed shape (game patch): forget and fall through to the scan.
+        modelPropByClass[mcn] = nil
+    end
+
     local holders = { menu }
     walkWidgets(menu, function(w)
         local cn = classNameOf(w)
@@ -442,10 +508,14 @@ local function resolveModel(menu)
             local val = nil
             pcall(function() val = holder:GetPropertyValue(pname) end)
             if looksLikeModel(val) then
+                -- Remember the shortcut, but only when the model hangs off the
+                -- panel itself — a sub-widget's property is not reachable
+                -- without walking to that sub-widget again.
+                if holder == menu and mcn then modelPropByClass[mcn] = pname end
                 -- Once per class: the world HUD opens and closes constantly as
                 -- the player moves past a machine, and re-logging every time
                 -- floods UE4SS.log during normal play.
-                logOnce("model:" .. tostring(classNameOf(menu)),
+                logOnce("model:" .. tostring(mcn),
                     string.format("model found via %s.%s (%s)",
                         classNameOf(holder) or "?", pname, classNameOf(val) or "?"))
                 return val
@@ -550,18 +620,31 @@ local function labelMatches(label)
     return false
 end
 
--- Enable one button widget. CommonUI buttons carry their own interaction flag
--- on top of UWidget's enabled state, so both are set when available.
+-- Enable one button widget, and ONLY if it is actually disabled.
+--
+-- Writing the flag unconditionally is what made the button flicker once per
+-- refresh interval: SetIsEnabled/SetIsInteractionEnabled re-apply the CommonUI
+-- button style even when the value does not change. Since this button reports
+-- enabled=true even with an empty hatchery, the unconditional write was a pure
+-- cosmetic defect with no upside. Returns true when the button is usable —
+-- whether we had to touch it or not.
 local function enableButton(w, why)
-    local before = nil
-    pcall(function() before = w:GetIsEnabled() end)
-    pcall(function() w:SetIsEnabled(true) end)
-    pcall(function() w:SetIsInteractionEnabled(true) end)
+    local enabled, interaction = nil, nil
+    pcall(function() enabled = w:GetIsEnabled() end)
+    pcall(function() interaction = w:GetIsInteractionEnabled() end)
+
+    -- Already usable: leave it completely alone.
+    if enabled ~= false and interaction ~= false then return true end
+
+    if enabled == false then pcall(function() w:SetIsEnabled(true) end) end
+    if interaction == false then pcall(function() w:SetIsInteractionEnabled(true) end) end
+
     local after = nil
     pcall(function() after = w:GetIsEnabled() end)
     logOnce("enable:" .. tostring(classNameOf(w)) .. ":" .. why,
-        string.format("collect button (%s, %s): enabled %s -> %s",
-            why, tostring(classNameOf(w)), tostring(before), tostring(after)))
+        string.format("collect button (%s, %s): enabled %s/interaction %s -> %s",
+            why, tostring(classNameOf(w)), tostring(enabled), tostring(interaction),
+            tostring(after)))
     return after == true
 end
 
@@ -577,6 +660,17 @@ local function enableNamedCollectButtons(menu)
         end
     end
     return touched
+end
+
+-- Does this panel have a named collect button at all? Cached per panel, so the
+-- label fallback (which walks the tree) can never run on a panel that has one.
+local function hasNamedCollectButton(menu)
+    for _, pname in ipairs(CONFIG.COLLECT_BUTTON_PROPS) do
+        local btn = nil
+        local ok = pcall(function() btn = menu[pname] end)
+        if ok and alive(btn) then return true end
+    end
+    return false
 end
 
 local function enableCollectButtonsByLabel(menu)
@@ -599,11 +693,13 @@ local function enableCollectButtonsByLabel(menu)
     return touched
 end
 
--- Named property first, label scan only if that found nothing.
-local function enableCollectButtons(menu)
-    local touched = enableNamedCollectButtons(menu)
-    if touched == 0 then touched = enableCollectButtonsByLabel(menu) end
-    return touched
+-- Named property first; the tree-walking label scan is a fallback for panels
+-- that have no named button at all, and is decided once per panel (st.named),
+-- never per refresh.
+local function enableCollectButtons(st)
+    if st.named == nil then st.named = hasNamedCollectButton(st.widget) end
+    if st.named then return enableNamedCollectButtons(st.widget) end
+    return enableCollectButtonsByLabel(st.widget)
 end
 
 local function autoCollect(model)
@@ -674,11 +770,10 @@ local function dumpPanel(entry)
             log(string.format("%s (%s) enabled=%s interaction=%s vis=%s label='%s'", pname,
                 tostring(classNameOf(btn)), tostring(en), tostring(ie), tostring(vis),
                 widgetLabel(btn)))
-            -- Verified with an EMPTY hatchery: enabled=true even though nothing
-            -- is collectible — so UWidget's enabled flag is NOT what greys this
-            -- button. Dump its class chain so that, the first time a hatch is
-            -- actually ready, the log already shows which flag/function does.
-            dumpClassChain(btn, "collect button class chain")
+            -- The class-chain dump that used to sit here has served its purpose:
+            -- WBP_CommonButton_C derives straight from UserWidget, has no
+            -- enabled/disabled state, and drives its look purely through
+            -- animations (Anm_DefaultToRed, AnmEvent_Red/Normal/Focus).
         else
             log(pname .. ": not present on this panel")
         end
@@ -697,7 +792,8 @@ end
 -- ---------------------------------------------------------------------------
 -- Tick
 -- ---------------------------------------------------------------------------
-local REFRESH_EVERY_N_TICKS = math.max(1, math.floor(CONFIG.REFRESH_INTERVAL_MS / CONFIG.POLL_MS))
+local HEARTBEAT_TICKS = CONFIG.HEARTBEAT_MS > 0
+    and math.max(1, math.floor(CONFIG.HEARTBEAT_MS / CONFIG.POLL_MS)) or 0
 
 local tickCount = 0
 local panels = {}        -- id -> state { widget, class, id, model, ticks, lastHatched }
@@ -705,27 +801,64 @@ local panelCount = 0
 local dumpedClasses = {} -- class name -> true
 local dumpRequested = false
 
-local function servicePanel(st)
-    local menu = st.widget
+-- The world HUD over a machine closes and re-opens constantly while the player
+-- moves around, and each fresh entry would otherwise redo the expensive setup:
+-- resolveModel walks the widget tree and reflects every ObjectProperty, and the
+-- sub-widget list is another walk. The widget instance is reused, so its full
+-- name is a stable key — remember the resolved state for the last few panels.
+local panelCache = {}      -- id -> { model, subWidgets, named, lastHatched }
+local panelCacheIds = {}   -- insertion order, for eviction
+local PANEL_CACHE_MAX = 8
 
+local function cachePanel(st)
+    if panelCache[st.id] == nil then
+        panelCacheIds[#panelCacheIds + 1] = st.id
+        if #panelCacheIds > PANEL_CACHE_MAX then
+            local oldest = table.remove(panelCacheIds, 1)
+            panelCache[oldest] = nil
+        end
+    end
+    panelCache[st.id] = {
+        model = st.model,
+        subWidgets = st.subWidgets,
+        named = st.named,
+        lastHatched = st.lastHatched,
+    }
+end
+
+local function servicePanel(st)
     local hatched = hatchedCount(st.model)
 
-    st.ticks = st.ticks + 1
-    local changed = hatchSignal or
-        (hatched ~= nil and st.lastHatched ~= nil and hatched > st.lastHatched)
+    -- A change in either direction matters: up = something finished, down =
+    -- the player collected, and the panel has to follow both.
+    local countChanged = hatched ~= nil and st.lastHatched ~= nil and hatched ~= st.lastHatched
+    local changed = st.forceRefresh or hatchSignal or countChanged
 
-    if changed or st.ticks >= REFRESH_EVERY_N_TICKS then
+    -- Heartbeat only where we have no change detector at all.
+    st.ticks = st.ticks + 1
+    local heartbeat = hatched == nil and HEARTBEAT_TICKS > 0 and st.ticks >= HEARTBEAT_TICKS
+
+    if changed or heartbeat then
+        st.forceRefresh = false
         st.ticks = 0
-        refreshPanel(menu)
-        if hatched ~= nil and hatched > 0 then
-            if CONFIG.ENABLE_BUTTONS then enableCollectButtons(menu) end
+        refreshPanel(st)
+
+        -- Button and collect act on real transitions only. Repeating them while
+        -- the state sits still is what flickered the button / would have spammed
+        -- the same RPC at the server.
+        if changed and hatched ~= nil and hatched > 0 then
+            if CONFIG.ENABLE_BUTTONS then enableCollectButtons(st) end
             if CONFIG.AUTO_COLLECT then autoCollect(st.model) end
         end
     end
 
     if hatched ~= nil then
-        if st.lastHatched ~= hatched then
-            log(string.format("%s: %d hatched slot(s)", st.class, hatched))
+        -- Only real transitions are worth a line. The first read after a panel
+        -- opens is not one: panels are recreated on every open, so logging it
+        -- meant a "0 hatched slot(s)" every time the player glanced at a machine.
+        if st.lastHatched ~= nil and st.lastHatched ~= hatched then
+            log(string.format("%s: %d hatched slot(s) (was %d)",
+                st.class, hatched, st.lastHatched))
         end
         st.lastHatched = hatched
     end
@@ -734,27 +867,43 @@ end
 local function tickBody()
     tickCount = tickCount + 1
 
-    -- Drop panels that closed or died.
+    -- Drop panels that closed or died, keeping their resolved state around for
+    -- the very likely re-open.
     for id, st in pairs(panels) do
         if not alive(st.widget) or not isShowing(st.widget) then
+            cachePanel(st)
             panels[id] = nil
             panelCount = panelCount - 1
         end
     end
 
-    -- Scan for panels: every tick while none is open would be wasteful, and
-    -- every findMenus() sweeps the object array once per class.
+    -- Scan for panels. Every findMenus() sweeps the UObject array once per
+    -- class that is not already being serviced, so it runs rarely: a few
+    -- seconds of delay before the mod picks a panel up is irrelevant (the
+    -- point of the mod plays out over minutes of incubation), while a sweep
+    -- every couple of ticks is a hitch the player can feel.
     local scanDue = dumpRequested or
         (panelCount == 0 and (tickCount % CONFIG.IDLE_EVERY_NTH_TICK) == 0) or
         (panelCount > 0 and (tickCount % CONFIG.RESCAN_EVERY_NTH_TICK) == 0)
 
     if scanDue then
-        for _, entry in ipairs(findMenus()) do
+        local have = {}
+        for _, st in pairs(panels) do have[st.class] = true end
+        for _, entry in ipairs(findMenus(have)) do
             if panels[entry.id] == nil then
-                entry.model = resolveModel(entry.widget)
-                if alive(entry.model) then hookHatchNotifies(entry.model) end
-                entry.ticks = REFRESH_EVERY_N_TICKS -- refresh on the opening tick
-                entry.lastHatched = nil
+                local cached = panelCache[entry.id]
+                if cached and alive(cached.model) then
+                    entry.model = cached.model
+                    entry.subWidgets = cached.subWidgets
+                    entry.named = cached.named
+                    entry.lastHatched = cached.lastHatched
+                else
+                    entry.model = resolveModel(entry.widget)
+                    if alive(entry.model) then hookHatchNotifies(entry.model) end
+                    entry.lastHatched = nil
+                end
+                entry.ticks = 0
+                entry.forceRefresh = true -- one refresh on the opening tick
                 panels[entry.id] = entry
                 panelCount = panelCount + 1
                 logOnce("open:" .. entry.class, "panel serviced: " .. entry.class)
@@ -813,5 +962,5 @@ pcall(function()
     log("dump key bound: " .. CONFIG.DUMP_KEY)
 end)
 
-log(string.format("v%s ready. Refresh every %dms per open incubator panel.",
-    VERSION, CONFIG.REFRESH_INTERVAL_MS))
+log(string.format("v%s ready. Change-driven refresh; heartbeat %s.",
+    VERSION, HEARTBEAT_TICKS > 0 and (CONFIG.HEARTBEAT_MS .. "ms (detector-less panels only)") or "off"))

@@ -15,8 +15,12 @@ wieder rein, um einsammeln zu können.
 Für **jedes** gerade sichtbare Incubator-Panel (World-HUD über der Maschine wie
 auch das große Interaktionsfenster):
 
-1. ruft er die **panel-eigenen** Display-Update-Funktionen periodisch erneut auf
-   (Standard: alle 2 s), damit Zeilen und Button dem echten Zustand folgen.
+1. ruft er die **panel-eigenen** Display-Update-Funktionen erneut auf, wenn sich
+   etwas ändert — Panel geöffnet, Hatch-Hook gefeuert, oder die Anzahl
+   geschlüpfter Slots hat sich bewegt (billiger nativer Getter, jede 500 ms
+   gepollt, ohne die UI anzufassen). **Nicht** periodisch: ein Panel ohne
+   Zustandsänderung erneut anzustoßen, spielt dessen „fertig"-Darstellung neu
+   ab und lässt den Collect-Button flackern.
    Live gefunden auf Palworld 1.0:
    `WBP_IngameMenu_Incubator_Multiple_C` → `OnEggArrayUpdated()`,
    `WBP_Ingame_Incubator_Multiple_C` → `OnEggArrayUpdated()`, `UpdateSimpleSlot()`,
@@ -32,7 +36,15 @@ auch das große Interaktionsfenster):
    Gemessen: dieser Button meldet `enabled=true` **auch bei leerer Maschine**
    (Label `Alle ausgebrüteten Pals abholen`). Sein Grau-Zustand hängt also nicht
    am `IsEnabled`-Flag von `UWidget` — Punkt 3 ist damit nur Absicherung, der
-   eigentliche Fix ist der Refresh aus Punkt 1.
+   eigentliche Fix ist der Refresh aus Punkt 1. Das Flag wird deshalb **nur**
+   geschrieben, wenn es tatsächlich `false` ist: das bedingungslose Setzen ließ
+   den Button im Refresh-Takt flackern.
+
+## Status
+
+Im Spiel bestätigt: läuft der Timer ab, während das Fenster offen ist, springt
+die Anzeige um und der Collect-Button funktioniert, ohne das Fenster zu
+verlassen.
 
 Eingesammelt wird weiter vanilla: du klickst den Button. `AUTO_COLLECT = true`
 in der CONFIG lässt den Mod stattdessen `RequestObtainAllHatchedCharacter`
@@ -72,7 +84,7 @@ die Heuristik auf deinem Build daneben liegt.
 
 | Option | Default | Bedeutung |
 | --- | --- | --- |
-| `REFRESH_INTERVAL_MS` | `2000` | Intervall des periodischen Panel-Refresh |
+| `HEARTBEAT_MS` | `15000` | Nur für Panels **ohne** Änderungs-Detektor (Einzel-Inkubator, dessen Modell kein `GetHatchedStateArray` hat). `0` = aus. Reguläre Panels werden rein ereignisgesteuert aktualisiert |
 | `ENABLE_BUTTONS` | `true` | Deaktivierten Collect-Button entgrauen |
 | `COLLECT_LABELS` | `{"collect","einsammeln",…}` | Button-Label-Filter (Kleinschreibung); leere Liste = jeder deaktivierte Button. Das Label jedes deaktivierten Buttons landet einmalig im Log |
 | `AUTO_COLLECT` | `false` | Einsammeln automatisch auslösen |
